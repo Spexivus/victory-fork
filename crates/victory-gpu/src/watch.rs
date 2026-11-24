@@ -522,10 +522,30 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             for alias in crate::inplace::pages_of(block * BLOCK) {
                 let alias = alias / BLOCK;
                 if alias != block {
-                    protect_here(g, alias, alias + 1);
+                    protect_alias(g, alias);
                 }
             }
         }
+    }
+}
+
+/// Makes `block` read-only: another view of pages a copy has just taken
+/// through its own view, so that a write through this one faults too. It is
+/// not noted clean. The copies of title memory at this view have not taken
+/// the pages: noted clean, the block would not be reported written at their
+/// next check and they would keep the bytes from before the write (`guard`
+/// reports a block that is read-only and not clean as written, then notes it
+/// clean). A block that is clean stays so: had the pages been written since
+/// its copies took them, `open` would have opened it.
+fn protect_alias(g: &mut Guards, block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    if g.protected.contains(&block) {
+        return;
+    }
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+        g.protected.insert(block);
     }
 }
 
@@ -1195,6 +1215,34 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// Both views of the pages are checked, each for a copy of its own
+    /// (the title shows one physical page at several addresses, and each
+    /// address has its host copy): a write through either is reported at
+    /// both, whichever is checked first. Guarding the pages for the first
+    /// view's check must not note the second view clean, or its copy would
+    /// keep the bytes from before the write.
+    #[test]
+    fn a_write_is_reported_at_every_checked_view() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]), "the second view's first check");
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()), "nothing written yet");
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((two + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 1)]), "written through this view, checked second");
+        // SAFETY: the first view, as above.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0)]));
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0)]), "written through this view, checked second");
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        drop_views(section, &[one, two], SIZE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the
